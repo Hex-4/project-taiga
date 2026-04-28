@@ -1,0 +1,1337 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>taiga - viewer</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #0a0a0a;
+      color: #e6e6e6;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid #222;
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    header .spacer { flex: 1; }
+    h1 { margin: 0; font-size: 1rem; letter-spacing: 0.02em; }
+    .dot {
+      display: inline-block;
+      width: 0.6rem;
+      height: 0.6rem;
+      border-radius: 50%;
+      margin-right: 0.4rem;
+      background: #555;
+    }
+    .dot.live { background: #3a8a3a; }
+    .dot.err  { background: #c04040; }
+    #stillness { font-variant-numeric: tabular-nums; }
+    #stillness[data-stationary="true"] { color: #ff6a6a; font-weight: 700; }
+    #stage {
+      flex: 1;
+      display: grid;
+      place-items: center;
+      padding: 1rem;
+      min-height: 0;
+    }
+    #frameWrap {
+      position: relative;
+      max-width: 100%;
+      max-height: 100%;
+    }
+    #frame, #overlay {
+      display: block;
+      max-width: 100%;
+      max-height: calc(100vh - 8rem);
+      border-radius: 4px;
+    }
+    #frame { border: 1px solid #222; background: #111; }
+    #overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      width: 100%;
+      height: 100%;
+    }
+    #banner {
+      position: absolute;
+      top: 1rem;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(220, 60, 60, 0.9);
+      color: white;
+      padding: 0.5rem 1.25rem;
+      border-radius: 999px;
+      font-weight: 700;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    #banner[data-on="true"] { opacity: 1; }
+    /* calibration */
+    #frame, #overlay, #calib-layer {
+      max-width: 100%;
+      max-height: calc(100vh - 8rem);
+    }
+    #calib-layer {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    #calib-layer.active { pointer-events: auto; cursor: crosshair; }
+    #calibration {
+      border-top: 1px solid #222;
+      background: #0d0d0f;
+      padding: 0.6rem 1rem 1rem;
+      display: grid;
+      gap: 0.5rem;
+      font-size: 0.85rem;
+    }
+    #calibration h2 { margin: 0; font-size: 0.85rem; font-weight: 600; color: #ddd; }
+    #calibration .row {
+      display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center;
+    }
+    #calibration button {
+      background: #1a1a1f; color: #e6e6e6; border: 1px solid #333;
+      padding: 0.35rem 0.75rem; border-radius: 6px; font: inherit; cursor: pointer;
+      font-size: 0.8rem;
+    }
+    #calibration button:hover:not(:disabled) { border-color: #6aa9ff; }
+    #calibration button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #calibration button.active { background: #2a4a2a; border-color: #3a8a3a; color: #d0ffd0; }
+    #calibration .pts {
+      max-height: 10rem; overflow-y: auto;
+      border: 1px solid #222; border-radius: 4px; background: #0a0a0a;
+      font-size: 0.75rem;
+    }
+    #calibration .pts .pt {
+      padding: 0.25rem 0.5rem; display: flex; gap: 0.5rem; align-items: center;
+      border-bottom: 1px solid #181818;
+    }
+    #calibration .pts .pt:last-child { border-bottom: 0; }
+    #calibration .pts .pt .idx { color: #888; width: 1.5rem; }
+    #calibration .pts .pt button {
+      padding: 0.1rem 0.45rem; font-size: 0.7rem; color: #ff9a9a; margin-left: auto;
+    }
+    #calibration .hint { color: #888; font-size: 0.75rem; }
+    /* events */
+    #events {
+      border-top: 1px solid #222;
+      background: #0d0d0f;
+      padding: 0.6rem 1rem 1rem;
+      font-size: 0.8rem;
+    }
+    #events h2 { margin: 0 0 0.4rem; font-size: 0.85rem; color: #ddd; font-weight: 600; }
+    .events-body {
+      max-height: 14rem;
+      overflow-y: auto;
+      border: 1px solid #222;
+      background: #0a0a0a;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+    }
+    .ev-row {
+      padding: 0.2rem 0.5rem;
+      display: flex; gap: 0.5rem;
+      border-bottom: 1px solid #161616;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .ev-row:last-child { border-bottom: 0; }
+    .ev-row .ev-ts { color: #666; flex: 0 0 5rem; }
+    .ev-row .ev-kind { flex: 0 0 4rem; font-weight: 600; }
+    .ev-row[data-kind="threat"] .ev-kind { color: #ffd93a; }
+    .ev-row[data-kind="turret"] .ev-kind { color: #6aa9ff; }
+    .ev-row .ev-msg { color: #ccc; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+    .hint { color: #888; font-size: 0.8rem; }
+    code {
+      background: #1a1a1f;
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+      color: #b5c7ff;
+    }
+    details.tune {
+      border-bottom: 1px solid #222;
+      background: #0d0d0f;
+    }
+    details.tune > summary {
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      color: #9fc6ff;
+      font-size: 0.85rem;
+      list-style: none;
+      user-select: none;
+    }
+    details.tune > summary::-webkit-details-marker { display: none; }
+    details.tune > summary::before {
+      content: "▸ ";
+      display: inline-block;
+      transition: transform 0.1s;
+    }
+    details.tune[open] > summary::before { content: "▾ "; }
+    details.tune .knobs {
+      padding: 0.5rem 1rem 1rem;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.6rem 1.2rem;
+      font-size: 0.8rem;
+    }
+    /* turret panel */
+    #turret {
+      border-top: 1px solid #222;
+      background: #0d0d0f;
+      padding: 0.6rem 1rem 1rem;
+      display: grid;
+      gap: 0.6rem;
+      font-size: 0.85rem;
+    }
+    #turret h2 {
+      margin: 0;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #ddd;
+      letter-spacing: 0.02em;
+    }
+    #turret .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1rem;
+      align-items: center;
+    }
+    #turret .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.2rem 0.55rem;
+      border: 1px solid #2a2a32;
+      border-radius: 999px;
+      background: #161619;
+      font-size: 0.75rem;
+      color: #bbb;
+    }
+    #turret .pill b { color: #e6e6e6; font-weight: 600; font-variant-numeric: tabular-nums; }
+    #turret .pill.good { border-color: #3a8a3a; color: #aee0ae; }
+    #turret .pill.warn { border-color: #a68a3a; color: #efd28a; }
+    #turret .pill.bad  { border-color: #a04040; color: #ff9a9a; }
+    #turret button {
+      background: #1a1a1f;
+      color: #e6e6e6;
+      border: 1px solid #333;
+      padding: 0.35rem 0.75rem;
+      border-radius: 6px;
+      font: inherit;
+      cursor: pointer;
+      font-size: 0.8rem;
+    }
+    #turret button:hover:not(:disabled) { border-color: #6aa9ff; }
+    #turret button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #turret button.fire {
+      background: #4a1010;
+      border-color: #a04040;
+      color: #ffd0d0;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+    }
+    #turret button.fire:hover:not(:disabled) { background: #7a1010; }
+    #turret button.toggle[data-on="true"] {
+      background: #2a4a2a;
+      border-color: #3a8a3a;
+      color: #d0ffd0;
+    }
+    #turret button.toggle[data-on="false"] {
+      background: #1a1a1f;
+      color: #999;
+    }
+    #turret .aim-pad {
+      display: grid;
+      grid-template-columns: repeat(3, auto);
+      gap: 0.2rem;
+      justify-content: start;
+    }
+    #turret .aim-pad button {
+      width: 2.2rem;
+      height: 2rem;
+      padding: 0;
+      font-size: 0.9rem;
+    }
+    #turret .aim-pad .empty { width: 2.2rem; }
+    #turret .last-reply {
+      color: #888;
+      font-size: 0.75rem;
+      font-family: inherit;
+      min-height: 1em;
+    }
+    #turret .last-reply.err { color: #ff9a9a; }
+    #turret .last-reply.ok { color: #aee0ae; }
+
+    /* class picker */
+    details.classes {
+      border-bottom: 1px solid #222;
+      background: #0d0d0f;
+    }
+    details.classes > summary {
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      color: #9fc6ff;
+      font-size: 0.85rem;
+      list-style: none;
+      user-select: none;
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    details.classes > summary::-webkit-details-marker { display: none; }
+    details.classes > summary::before { content: "▸ "; display: inline-block; }
+    details.classes[open] > summary::before { content: "▾ "; }
+    .class-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.15rem 0.5rem;
+      background: #22313f;
+      color: #cde5ff;
+      border-radius: 999px;
+      font-size: 0.7rem;
+    }
+    .class-chip button {
+      border: none; background: transparent; color: inherit;
+      cursor: pointer; padding: 0; font: inherit; opacity: 0.6;
+    }
+    .class-chip button:hover { opacity: 1; }
+    .class-body { padding: 0 1rem 1rem; display: grid; gap: 0.6rem; font-size: 0.8rem; }
+    #class-search {
+      width: 100%; max-width: 280px;
+      padding: 0.35rem 0.6rem;
+      background: #161619; border: 1px solid #2a2a32; color: #e6e6e6;
+      border-radius: 6px; font: inherit;
+    }
+    .class-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 0.15rem 0.5rem;
+      max-height: 20rem; overflow-y: auto;
+      padding: 0.25rem 0; border-top: 1px solid #222;
+    }
+    .class-grid label {
+      display: flex; gap: 0.4rem; align-items: center;
+      padding: 0.15rem 0.25rem; border-radius: 4px; cursor: pointer; color: #bbb;
+    }
+    .class-grid label:hover { background: #1a1a1f; }
+    .class-grid label.hidden { display: none; }
+    .class-grid input[type="checkbox"] { accent-color: #6aa9ff; }
+    .class-grid .cls-id { color: #666; font-size: 0.7rem; }
+
+    .knob { display: flex; flex-direction: column; gap: 0.2rem; }
+    .knob-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem;
+      color: #bbb;
+    }
+    .knob-label b { color: #e6e6e6; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .knob-hint { color: #777; font-size: 0.7rem; line-height: 1.3; }
+    .knob input[type="range"] { width: 100%; accent-color: #6aa9ff; }
+    .knob[data-saving="true"] b { color: #ffd93a; }
+    .knob[data-error="true"] b { color: #ff6a6a; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>taiga viewer</h1>
+    <span><span id="ws-dot" class="dot"></span><span id="ws-status">connecting...</span></span>
+    <span id="res">-</span>
+    <span id="fps">0 fps</span>
+    <span id="det">0 cats</span>
+    <span id="stillness">still: 0.0s</span>
+    <span id="inf">- ms</span>
+    <span class="spacer"></span>
+    <span class="hint">open <code>/phone</code> on your phone to stream</span>
+  </header>
+
+  <details class="tune" id="tune">
+    <summary>tune detector &amp; tracker</summary>
+    <div class="knobs" id="knobs">
+      <!-- populated by js from /config -->
+    </div>
+  </details>
+
+  <details class="classes" id="classes">
+    <summary>
+      <span>target classes:</span>
+      <span id="class-chips"></span>
+    </summary>
+    <div class="class-body">
+      <input id="class-search" type="search" placeholder="search (e.g. cat, person, dog)..." />
+      <div class="class-grid" id="class-grid"><!-- populated from /classes --></div>
+    </div>
+  </details>
+
+  <section id="turret" aria-label="turret control">
+    <h2>turret</h2>
+
+    <div class="row">
+      <span class="pill" id="t-conn">conn: <b>-</b></span>
+      <span class="pill" id="t-armed">armed: <b>-</b></span>
+      <span class="pill" id="t-darts">darts: <b>-</b></span>
+      <span class="pill" id="t-pitch">pitch: <b>-</b></span>
+      <span class="pill" id="t-yaw">yaw: <b>-</b></span>
+      <span class="pill" id="t-cd">cooldown: <b>-</b></span>
+    </div>
+
+    <div class="row">
+      <button id="t-auto" class="toggle" data-action="toggle_auto">
+        auto-fire: <span>off</span>
+      </button>
+      <button id="t-arm" class="toggle" data-action="toggle_armed">
+        armed: <span>?</span>
+      </button>
+      <button id="t-fire" class="fire" data-action="fire">FIRE</button>
+      <button id="t-fire-override" data-action="fire_override" title="bypass cooldown">FIRE (override)</button>
+      <button data-action="home">HOME</button>
+      <button data-action="reload">RELOAD MAG</button>
+    </div>
+
+    <div class="row">
+      <button data-action="linearity_test" title="send 100/300/500ms pulses (alternating direction) to visually check yaw proportionality">linearity test</button>
+      <span class="hint" style="color:#888;font-size:0.75rem;">3 pulses of 100/300/500ms alternating L/R — watch for 3x/5x proportional rotations</span>
+    </div>
+
+    <div class="row">
+      <span style="color:#888;font-size:0.75rem;">aim</span>
+      <div class="aim-pad">
+        <span class="empty"></span>
+        <button data-aim="up" title="pitch +8">▲</button>
+        <span class="empty"></span>
+        <button data-aim="left" title="yaw ccw 150ms">◀</button>
+        <button data-aim="home" title="home">⌂</button>
+        <button data-aim="right" title="yaw cw 150ms">▶</button>
+        <span class="empty"></span>
+        <button data-aim="down" title="pitch -8">▼</button>
+        <span class="empty"></span>
+      </div>
+    </div>
+
+    <div class="row" id="t-timing">
+      <label class="knob" style="flex:1;min-width:180px;max-width:280px;">
+        <div class="knob-label">
+          <span>yaw pulse</span><b id="t-yaw-ms-val">- ms</b>
+        </div>
+        <input id="t-yaw-ms" type="range" min="50" max="1200" step="10" />
+        <div class="knob-hint">longer = more rotation per pulse, helps against cable drag.</div>
+      </label>
+      <label class="knob" style="flex:1;min-width:180px;max-width:280px;">
+        <div class="knob-label">
+          <span>roll (fire) pulse</span><b id="t-roll-ms-val">- ms</b>
+        </div>
+        <input id="t-roll-ms" type="range" min="80" max="500" step="5" />
+        <div class="knob-hint">too short = dart doesn't eject, too long = misfires extra darts.</div>
+      </label>
+    </div>
+
+    <div class="last-reply" id="t-reply">&nbsp;</div>
+  </section>
+
+  <div id="stage">
+    <div id="frameWrap">
+      <img id="frame" alt="waiting for frames..." />
+      <canvas id="overlay"></canvas>
+      <canvas id="calib-layer"></canvas>
+      <div id="banner">THREAT LOCKED</div>
+    </div>
+  </div>
+
+  <section id="calibration" aria-label="calibration">
+    <h2>aiming calibration</h2>
+    <div class="row">
+      <button id="c-mode" class="toggle" data-on="false">click-to-mark: <span>off</span></button>
+      <span class="hint" id="c-hint">toggle on, then click a spot on the video to stage it</span>
+    </div>
+    <div class="row">
+      <span class="hint" style="color:#c0a030">tip: home first, tune the <b>yaw deadband</b> in the tune panel until short &amp; long rotations are proportional, THEN calibrate. changing deadband after capture invalidates points.</span>
+    </div>
+    <div class="row">
+      <span class="hint">staged: <b id="c-staged">—</b></span>
+      <span class="hint">turret pose now: <b id="c-pose">—</b></span>
+      <button id="c-capture" disabled>capture here</button>
+      <button id="c-aim" disabled title="move turret to estimated aim for the staged pixel">test aim</button>
+      <button id="c-clear" title="remove all calibration points">clear all</button>
+    </div>
+    <div class="pts" id="c-points"></div>
+  </section>
+
+  <section id="events" aria-label="event log">
+    <h2>events</h2>
+    <div class="events-body" id="events-body">
+      <div class="ev-row" style="color:#666">(no events yet)</div>
+    </div>
+  </section>
+
+  <script>
+    const img = document.getElementById("frame");
+    const overlay = document.getElementById("overlay");
+    const wsDot = document.getElementById("ws-dot");
+    const wsStatus = document.getElementById("ws-status");
+    const resEl = document.getElementById("res");
+    const fpsEl = document.getElementById("fps");
+    const detEl = document.getElementById("det");
+    const stillnessEl = document.getElementById("stillness");
+    const infEl = document.getElementById("inf");
+    const bannerEl = document.getElementById("banner");
+
+    let currentUrl = null;
+    let framesReceived = 0;
+    let latestPayload = null;
+
+    function setStatus(state, text) {
+      wsDot.className = "dot " + (state || "");
+      wsStatus.textContent = text;
+    }
+
+    function renderFrame(blob) {
+      const url = URL.createObjectURL(blob);
+      const prev = currentUrl;
+      img.onload = () => {
+        resEl.textContent = `${img.naturalWidth}x${img.naturalHeight}`;
+        if (prev) URL.revokeObjectURL(prev);
+      };
+      img.src = url;
+      currentUrl = url;
+    }
+
+    function drawOverlay() {
+      // size overlay to match the rendered img
+      const rect = img.getBoundingClientRect();
+      const w = Math.round(rect.width * devicePixelRatio);
+      const h = Math.round(rect.height * devicePixelRatio);
+      if (overlay.width !== w || overlay.height !== h) {
+        overlay.width = w;
+        overlay.height = h;
+      }
+      const ctx = overlay.getContext("2d");
+      ctx.clearRect(0, 0, w, h);
+
+      if (!latestPayload || !img.naturalWidth) return;
+      const imgW = latestPayload.image_size ? latestPayload.image_size[0] : img.naturalWidth;
+      const imgH = latestPayload.image_size ? latestPayload.image_size[1] : img.naturalHeight;
+      if (!imgW || !imgH) return;
+      const sx = w / imgW;
+      const sy = h / imgH;
+
+      ctx.lineWidth = 2 * devicePixelRatio;
+      ctx.font = `${12 * devicePixelRatio}px ui-monospace, monospace`;
+      ctx.textBaseline = "top";
+
+      const track = latestPayload.track || {};
+      const trackedBbox = track.bbox || null;
+      const bridged = !!track.bridged;
+
+      const drawBox = (x, y, ww, hh, color, label, dashed) => {
+        ctx.strokeStyle = color;
+        ctx.setLineDash(dashed ? [8 * devicePixelRatio, 6 * devicePixelRatio] : []);
+        ctx.strokeRect(x, y, ww, hh);
+        ctx.setLineDash([]);
+        const padX = 4 * devicePixelRatio, padY = 2 * devicePixelRatio;
+        const labelW = ctx.measureText(label).width + padX * 2;
+        const labelH = 12 * devicePixelRatio + padY * 2;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, Math.max(0, y - labelH), labelW, labelH);
+        ctx.fillStyle = "#000";
+        ctx.fillText(label, x + padX, Math.max(0, y - labelH) + padY);
+      };
+
+      if (bridged && trackedBbox) {
+        const x = trackedBbox[0] * sx;
+        const y = trackedBbox[1] * sy;
+        const ww = (trackedBbox[2] - trackedBbox[0]) * sx;
+        const hh = (trackedBbox[3] - trackedBbox[1]) * sy;
+        const color = track.stationary ? "#ff3a3a" : "#ffd93a";
+        drawBox(x, y, ww, hh, color, "tracking (no lock)", true);
+        return;
+      }
+
+      for (const d of latestPayload.detections || []) {
+        const x = d.x1 * sx;
+        const y = d.y1 * sy;
+        const ww = (d.x2 - d.x1) * sx;
+        const hh = (d.y2 - d.y1) * sy;
+        const isTracked = trackedBbox
+          && Math.abs(d.x1 - trackedBbox[0]) < 0.5
+          && Math.abs(d.y1 - trackedBbox[1]) < 0.5;
+        const color = isTracked
+          ? (track.stationary ? "#ff3a3a" : "#ffd93a")
+          : "#3affa0";
+        const label = `${d.cls} ${(d.conf * 100).toFixed(0)}%`;
+        drawBox(x, y, ww, hh, color, label, false);
+      }
+    }
+
+    (function rafLoop() {
+      drawOverlay();
+      requestAnimationFrame(rafLoop);
+    })();
+
+    function updateHudFromPayload(msg) {
+      const n = (msg.detections || []).length;
+      detEl.textContent = `${n} cat${n === 1 ? "" : "s"}`;
+      const t = msg.track || {};
+      stillnessEl.textContent = `still: ${(t.stillness_s || 0).toFixed(1)}s`;
+      stillnessEl.dataset.stationary = t.stationary ? "true" : "false";
+      bannerEl.dataset.on = t.stationary ? "true" : "false";
+    }
+
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${proto}//${location.host}/ws/view`);
+      ws.binaryType = "blob";
+      setStatus("", "connecting...");
+      ws.addEventListener("open", () => setStatus("live", "connected"));
+      ws.addEventListener("close", () => {
+        setStatus("err", "disconnected - retrying");
+        setTimeout(connect, 1500);
+      });
+      ws.addEventListener("error", () => setStatus("err", "ws error"));
+      ws.addEventListener("message", (ev) => {
+        if (typeof ev.data === "string") {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "detections") {
+              latestPayload = msg;
+              updateHudFromPayload(msg);
+            } else if (msg.type === "heartbeat") {
+              setStatus(msg.ingest_connected ? "live" : "err",
+                msg.ingest_connected ? "connected - awaiting frames" : "no phone connected");
+            }
+          } catch (_) {}
+          return;
+        }
+        framesReceived++;
+        renderFrame(ev.data);
+        setStatus("live", "streaming");
+      });
+    }
+
+    // poll /stats for inference time (it's cheap, and avoids adding to ws payload)
+    setInterval(async () => {
+      try {
+        const r = await fetch("/stats");
+        const j = await r.json();
+        if (j.last_inference_ms) infEl.textContent = `${j.last_inference_ms.toFixed(0)} ms`;
+      } catch (_) {}
+      fpsEl.textContent = `${framesReceived} fps`;
+      framesReceived = 0;
+    }, 1000);
+
+    // --- tuning panel ---
+    //
+    // one slider per knob returned by /config. we debounce POSTs by ~150ms so
+    // dragging a slider doesn't spam the server, and we visually mark the knob
+    // as "saving" / "error" based on the response.
+
+    // each knob is grouped so we can render them under section headings.
+    // groups appear in this order; missing keys are ignored gracefully.
+    const KNOBS_META = {
+      // --- detector ---
+      conf_threshold: {
+        group: "detector",
+        label: "detector confidence",
+        step: 0.01,
+        format: (v) => v.toFixed(2),
+        hint: "min confidence for a detection to count. lower = more detections, more false positives.",
+      },
+      // --- tracker ---
+      still_threshold_frac: {
+        group: "tracker",
+        label: "still threshold",
+        step: 0.005,
+        format: (v) => (v * 100).toFixed(1) + "% short edge",
+        hint: "how much the target can wander and still count as stationary.",
+      },
+      still_duration_s: {
+        group: "tracker",
+        label: "still duration",
+        step: 0.5,
+        format: (v) => v.toFixed(1) + "s",
+        hint: "how long the target must be still before THREAT LOCKED fires.",
+      },
+      bridge_s: {
+        group: "tracker",
+        label: "detection bridge",
+        step: 0.1,
+        format: (v) => v.toFixed(1) + "s",
+        hint: "how long to coast on the last bbox when the detector blinks.",
+      },
+      history_s: {
+        group: "tracker",
+        label: "tracking history",
+        step: 0.5,
+        format: (v) => v.toFixed(1) + "s",
+        hint: "how much position history to retain. cap for stillness timer.",
+      },
+      // --- yaw / aim ---
+      yaw_deadband_l_ms: {
+        group: "yaw",
+        label: "yaw deadband ◀ (L/ccw)",
+        step: 1,
+        format: (v) => v.toFixed(0) + " ms",
+        hint: "ms lost to motor startup per LEFTWARD pulse.",
+      },
+      yaw_deadband_r_ms: {
+        group: "yaw",
+        label: "yaw deadband ▶ (R/cw)",
+        step: 1,
+        format: (v) => v.toFixed(0) + " ms",
+        hint: "ms lost to motor startup per RIGHTWARD pulse. usually != L.",
+      },
+      aim_settle_s: {
+        group: "yaw",
+        label: "aim settle",
+        step: 0.05,
+        format: (v) => v.toFixed(2) + "s",
+        hint: "wait after the yaw move completes before firing. 0 = fire immediately, may shoot mid-rotation.",
+      },
+      // --- fire policy ---
+      cooldown_s: {
+        group: "fire",
+        label: "fire cooldown",
+        step: 1,
+        format: (v) => v.toFixed(0) + "s",
+        hint: "min seconds between auto-fire events. raise to be gentle, lower to be aggressive.",
+      },
+      darts_per_event: {
+        group: "fire",
+        label: "darts per event",
+        step: 1,
+        format: (v) => v.toFixed(0),
+        hint: "1 = single warning shot per detection. 2 = double tap.",
+      },
+      // --- stream (phone capture) ---
+      stream_fps: {
+        group: "stream",
+        label: "stream fps",
+        step: 1,
+        format: (v) => v.toFixed(0) + " fps",
+        hint: "frames/sec uploaded from phone. 10 is plenty for cat tracking; higher uses more wifi.",
+      },
+      stream_jpeg_quality: {
+        group: "stream",
+        label: "jpeg quality",
+        step: 0.05,
+        format: (v) => (v * 100).toFixed(0) + "%",
+        hint: "jpeg encode quality. lower = smaller frames = less wifi load. 60% is a good default.",
+      },
+      stream_max_edge: {
+        group: "stream",
+        label: "stream resolution",
+        step: 80,
+        format: (v) => v.toFixed(0) + "px long edge",
+        hint: "max long-edge of upload. 640 is plenty for yolov8n. 320 is faster but tiny cats might be missed.",
+      },
+    };
+
+    const GROUP_ORDER = ["detector", "tracker", "yaw", "fire", "stream"];
+    const GROUP_LABELS = {
+      detector: "detector",
+      tracker:  "tracker",
+      yaw:      "yaw / aim",
+      fire:     "fire policy",
+      stream:   "stream (phone capture)",
+    };
+
+    const knobsEl = document.getElementById("knobs");
+    const knobNodes = new Map();
+
+    function renderKnob(key, meta, item) {
+      const wrap = document.createElement("label");
+      wrap.className = "knob";
+      wrap.dataset.key = key;
+      wrap.innerHTML = `
+        <div class="knob-label">
+          <span>${meta.label}</span>
+          <b class="knob-value"></b>
+        </div>
+        <input type="range" min="${item.min}" max="${item.max}" step="${meta.step}" value="${item.value}">
+        <div class="knob-hint">${meta.hint}</div>
+      `;
+      const input = wrap.querySelector("input");
+      const valEl = wrap.querySelector(".knob-value");
+      const paint = (v) => { valEl.textContent = meta.format(Number(v)); };
+      paint(input.value);
+
+      let pending = null;
+      let debounce = null;
+      const flush = async () => {
+        if (pending === null) return;
+        const v = pending;
+        pending = null;
+        wrap.dataset.saving = "true";
+        wrap.dataset.error = "false";
+        try {
+          const r = await fetch("/config", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ [key]: v }),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        } catch (e) {
+          wrap.dataset.error = "true";
+          console.warn("config save failed:", e);
+        } finally {
+          wrap.dataset.saving = "false";
+        }
+      };
+      input.addEventListener("input", () => {
+        paint(input.value);
+        pending = Number(input.value);
+        clearTimeout(debounce);
+        debounce = setTimeout(flush, 150);
+      });
+
+      knobsEl.appendChild(wrap);
+      knobNodes.set(key, { wrap, input, paint });
+    }
+
+    async function loadConfig() {
+      try {
+        const r = await fetch("/config");
+        const cfg = await r.json();
+        knobsEl.innerHTML = "";
+        knobNodes.clear();
+        // bucket keys by group, then render group-by-group with headings
+        const byGroup = new Map();
+        for (const g of GROUP_ORDER) byGroup.set(g, []);
+        for (const [key, meta] of Object.entries(KNOBS_META)) {
+          if (!cfg[key]) continue;
+          const g = meta.group || "misc";
+          if (!byGroup.has(g)) byGroup.set(g, []);
+          byGroup.get(g).push([key, meta]);
+        }
+        for (const [g, entries] of byGroup) {
+          if (!entries.length) continue;
+          const head = document.createElement("div");
+          head.style.gridColumn = "1 / -1";
+          head.style.color = "#9fc6ff";
+          head.style.fontSize = "0.75rem";
+          head.style.letterSpacing = "0.05em";
+          head.style.textTransform = "uppercase";
+          head.style.borderBottom = "1px solid #1c1c22";
+          head.style.padding = "0.4rem 0 0.2rem";
+          head.style.marginTop = entries === byGroup.get(GROUP_ORDER[0]) ? "0" : "0.5rem";
+          head.textContent = GROUP_LABELS[g] || g;
+          knobsEl.appendChild(head);
+          for (const [key, meta] of entries) {
+            renderKnob(key, meta, cfg[key]);
+          }
+        }
+      } catch (e) {
+        console.warn("config load failed:", e);
+      }
+    }
+    loadConfig();
+
+    // --- turret panel ---
+    const tConnEl   = document.querySelector("#t-conn b");
+    const tArmedEl  = document.querySelector("#t-armed b");
+    const tDartsEl  = document.querySelector("#t-darts b");
+    const tPitchEl  = document.querySelector("#t-pitch b");
+    const tYawEl    = document.querySelector("#t-yaw b");
+    const tCdEl     = document.querySelector("#t-cd b");
+    const tAutoBtn  = document.getElementById("t-auto");
+    const tArmBtn   = document.getElementById("t-arm");
+    const tFireBtn  = document.getElementById("t-fire");
+    const tReplyEl  = document.getElementById("t-reply");
+
+    let turretSnap = null;
+
+    function setReply(reply, isErr) {
+      tReplyEl.textContent = reply || "";
+      tReplyEl.className = "last-reply" + (reply ? (isErr ? " err" : " ok") : "");
+    }
+
+    async function sendTurret(action, args = {}) {
+      try {
+        const r = await fetch("/turret/command", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ action, args }),
+        });
+        const j = await r.json();
+        if (!r.ok) {
+          setReply(`${action}: HTTP ${r.status}`, true);
+          return j;
+        }
+        turretSnap = j;
+        renderTurret();
+        if (j.reply) setReply(`${action}: ${j.reply.body}`, !j.reply.ok);
+        return j;
+      } catch (e) {
+        setReply(`${action}: ${e.message}`, true);
+      }
+    }
+
+    async function refreshTurret() {
+      try {
+        const r = await fetch("/turret");
+        turretSnap = await r.json();
+        renderTurret();
+      } catch (_) {}
+    }
+
+    function pill(el, good, warn) {
+      const parent = el.parentElement;
+      parent.classList.remove("good", "warn", "bad");
+      if (good) parent.classList.add("good");
+      else if (warn) parent.classList.add("warn");
+      else parent.classList.add("bad");
+    }
+
+    function renderTurret() {
+      if (!turretSnap) return;
+      const s = turretSnap.state || {};
+      const p = turretSnap.policy || {};
+
+      tConnEl.textContent = s.connected ? (s.port || "yes") : "no";
+      pill(tConnEl, s.connected, false);
+
+      tArmedEl.textContent = s.armed ? "yes" : "no";
+      pill(tArmedEl, s.armed, false);
+
+      tDartsEl.textContent = s.darts_estimate ?? "-";
+      pill(tDartsEl, (s.darts_estimate ?? 0) > 0, (s.darts_estimate ?? 0) <= 2 && s.darts_estimate > 0);
+
+      tPitchEl.textContent = s.pitch ?? "-";
+      tPitchEl.parentElement.classList.remove("good","warn","bad");
+
+      tYawEl.textContent = (s.yaw_ms ?? 0) + "ms";
+      tYawEl.parentElement.classList.remove("good","warn","bad");
+
+      const cd = p.cooldown_remaining_s ?? 0;
+      tCdEl.textContent = cd > 0 ? cd.toFixed(1) + "s" : "ready";
+      pill(tCdEl, cd === 0, cd > 0);
+
+      tAutoBtn.dataset.on = !!p.auto_fire;
+      tAutoBtn.querySelector("span").textContent = p.auto_fire ? "ON" : "off";
+      tArmBtn.dataset.on = !!s.armed;
+      tArmBtn.querySelector("span").textContent = s.armed ? "YES" : "no";
+
+      const canFire = s.connected && s.armed && (s.darts_estimate ?? 0) > 0;
+      tFireBtn.disabled = !canFire;
+    }
+
+    // button wiring
+    document.querySelectorAll("#turret button[data-action]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const action = btn.dataset.action;
+        if (action === "toggle_auto") {
+          sendTurret("set_policy", { auto_fire: !(turretSnap?.policy?.auto_fire) });
+        } else if (action === "toggle_armed") {
+          sendTurret(turretSnap?.state?.armed ? "disarm" : "arm");
+        } else if (action === "fire") {
+          sendTurret("fire", { count: turretSnap?.policy?.darts_per_event || 1 });
+        } else if (action === "fire_override") {
+          if (!confirm("Fire immediately, ignoring cooldown?")) return;
+          sendTurret("fire", { count: 1, override_cooldown: true });
+        } else {
+          sendTurret(action);
+        }
+      });
+    });
+
+    document.querySelectorAll("#turret [data-aim]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const aim = btn.dataset.aim;
+        // yaw aim buttons use the current yaw-pulse slider value, not a
+        // hardcoded 150ms. the firmware honors whatever ms we send, so if we
+        // don't pass the slider value the "pulse" knob does nothing for clicks.
+        const yawMs = Number(document.getElementById("t-yaw-ms").value) || 150;
+        if (aim === "up") sendTurret("pitch_rel", { delta: 8 });
+        else if (aim === "down") sendTurret("pitch_rel", { delta: -8 });
+        else if (aim === "left") sendTurret("yaw", { direction: "L", ms: yawMs });
+        else if (aim === "right") sendTurret("yaw", { direction: "R", ms: yawMs });
+        else if (aim === "home") sendTurret("home");
+      });
+    });
+
+    // periodic refresh: mostly for the cooldown countdown, but also catches
+    // firmware-initiated state changes (IR remote use, boot banner, etc.)
+    setInterval(refreshTurret, 1000);
+    refreshTurret();
+
+    // turret timing sliders (debounced just like the tune knobs)
+    const yawMsEl = document.getElementById("t-yaw-ms");
+    const yawMsValEl = document.getElementById("t-yaw-ms-val");
+    const rollMsEl = document.getElementById("t-roll-ms");
+    const rollMsValEl = document.getElementById("t-roll-ms-val");
+    let timingPrev = { yaw_ms: null, roll_ms: null };
+    let timingDebounce = null;
+    function syncTimingFromState() {
+      if (!turretSnap) return;
+      const s = turretSnap.state || {};
+      if (s.yaw_pulse_ms != null && document.activeElement !== yawMsEl) {
+        yawMsEl.value = s.yaw_pulse_ms;
+      }
+      if (s.roll_pulse_ms != null && document.activeElement !== rollMsEl) {
+        rollMsEl.value = s.roll_pulse_ms;
+      }
+      yawMsValEl.textContent = yawMsEl.value + " ms";
+      rollMsValEl.textContent = rollMsEl.value + " ms";
+    }
+    // hook sync into renderTurret
+    const origRenderTurret = renderTurret;
+    renderTurret = function() { origRenderTurret(); syncTimingFromState(); };
+    function scheduleTimingSend() {
+      clearTimeout(timingDebounce);
+      timingDebounce = setTimeout(() => {
+        const args = {};
+        const y = Number(yawMsEl.value), r = Number(rollMsEl.value);
+        if (y !== timingPrev.yaw_ms) { args.yaw_ms = y; timingPrev.yaw_ms = y; }
+        if (r !== timingPrev.roll_ms) { args.roll_ms = r; timingPrev.roll_ms = r; }
+        if (Object.keys(args).length) sendTurret("set_timing", args);
+      }, 180);
+    }
+    [yawMsEl, rollMsEl].forEach((el) => {
+      el.addEventListener("input", () => {
+        yawMsValEl.textContent = yawMsEl.value + " ms";
+        rollMsValEl.textContent = rollMsEl.value + " ms";
+        scheduleTimingSend();
+      });
+    });
+
+    // --- target class picker ---
+    const classGridEl = document.getElementById("class-grid");
+    const classChipsEl = document.getElementById("class-chips");
+    const classSearchEl = document.getElementById("class-search");
+    let classAvailable = [];  // [{id, name}]
+    let classSelected = new Set();
+
+    function renderChips() {
+      classChipsEl.innerHTML = "";
+      const byId = new Map(classAvailable.map((c) => [c.id, c.name]));
+      const ordered = [...classSelected].sort((a, b) => a - b);
+      if (!ordered.length) {
+        const em = document.createElement("span");
+        em.textContent = "(none - system is blind)";
+        em.style.color = "#888";
+        em.style.fontSize = "0.75rem";
+        classChipsEl.appendChild(em);
+        return;
+      }
+      for (const id of ordered) {
+        const chip = document.createElement("span");
+        chip.className = "class-chip";
+        chip.innerHTML = `${byId.get(id) || id} <button title="remove" aria-label="remove">×</button>`;
+        chip.querySelector("button").addEventListener("click", (e) => {
+          e.preventDefault(); e.stopPropagation();
+          classSelected.delete(id);
+          saveClasses();
+        });
+        classChipsEl.appendChild(chip);
+      }
+    }
+
+    function renderGrid() {
+      classGridEl.innerHTML = "";
+      const q = classSearchEl.value.trim().toLowerCase();
+      for (const c of classAvailable) {
+        const hit = !q || c.name.toLowerCase().includes(q) || String(c.id) === q;
+        const label = document.createElement("label");
+        label.className = hit ? "" : "hidden";
+        label.innerHTML = `
+          <input type="checkbox" data-cls-id="${c.id}" ${classSelected.has(c.id) ? "checked" : ""}>
+          <span class="cls-name">${c.name}</span>
+          <span class="cls-id">#${c.id}</span>
+        `;
+        label.querySelector("input").addEventListener("change", (e) => {
+          const id = Number(e.target.dataset.clsId);
+          if (e.target.checked) classSelected.add(id); else classSelected.delete(id);
+          saveClasses();
+        });
+        classGridEl.appendChild(label);
+      }
+    }
+
+    let classesSaveDebounce = null;
+    async function saveClasses() {
+      renderChips();
+      clearTimeout(classesSaveDebounce);
+      classesSaveDebounce = setTimeout(async () => {
+        try {
+          const r = await fetch("/classes", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ids: [...classSelected] }),
+          });
+          if (!r.ok) console.warn("classes save failed:", await r.text());
+        } catch (e) {
+          console.warn("classes save failed:", e);
+        }
+      }, 120);
+    }
+
+    async function loadClasses() {
+      try {
+        const r = await fetch("/classes");
+        const j = await r.json();
+        classAvailable = j.available || [];
+        classSelected = new Set(j.selected || []);
+        renderGrid();
+        renderChips();
+      } catch (e) {
+        console.warn("classes load failed:", e);
+      }
+    }
+    classSearchEl.addEventListener("input", renderGrid);
+    loadClasses();
+
+    // --- calibration ---
+    const calibLayer = document.getElementById("calib-layer");
+    const calibCtx = () => calibLayer.getContext("2d");
+    const cModeBtn = document.getElementById("c-mode");
+    const cHintEl  = document.getElementById("c-hint");
+    const cStagedEl= document.getElementById("c-staged");
+    const cCapBtn  = document.getElementById("c-capture");
+    const cAimBtn  = document.getElementById("c-aim");
+    const cClearBtn= document.getElementById("c-clear");
+    const cPointsEl= document.getElementById("c-points");
+    let calibPoints = [];
+    let stagedPx = null;   // {px, py} in original image coords
+    let calibModeOn = false;
+
+    // convert a click on the <img> into its native image coordinates. the
+    // img is rendered with max-width/max-height so it may be letterboxed OR
+    // scaled down - we account for that by looking at getBoundingClientRect.
+    function clickToImagePx(ev) {
+      if (!img.naturalWidth) return null;
+      const rect = img.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      // css pixel -> image pixel (no letterboxing on <img> with object-fit: initial)
+      const ix = Math.round(x * (img.naturalWidth / rect.width));
+      const iy = Math.round(y * (img.naturalHeight / rect.height));
+      if (ix < 0 || iy < 0 || ix > img.naturalWidth || iy > img.naturalHeight) return null;
+      return { px: ix, py: iy };
+    }
+
+    function drawCalibLayer() {
+      const rect = img.getBoundingClientRect();
+      const w = Math.round(rect.width * devicePixelRatio);
+      const h = Math.round(rect.height * devicePixelRatio);
+      if (calibLayer.width !== w || calibLayer.height !== h) {
+        calibLayer.width = w;
+        calibLayer.height = h;
+      }
+      const ctx = calibCtx();
+      ctx.clearRect(0, 0, w, h);
+      if (!img.naturalWidth) return;
+      const sx = w / img.naturalWidth;
+      const sy = h / img.naturalHeight;
+
+      // existing points as numbered dots
+      ctx.font = `${11 * devicePixelRatio}px ui-monospace, monospace`;
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "center";
+      for (let i = 0; i < calibPoints.length; i++) {
+        const p = calibPoints[i];
+        const cx = p.px * sx, cy = p.py * sy;
+        ctx.fillStyle = "rgba(106, 169, 255, 0.9)";
+        ctx.beginPath();
+        ctx.arc(cx, cy, 10 * devicePixelRatio, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#0d0d0f";
+        ctx.lineWidth = 2 * devicePixelRatio;
+        ctx.stroke();
+        ctx.fillStyle = "#0d0d0f";
+        ctx.fillText(String(i + 1), cx, cy + devicePixelRatio);
+      }
+
+      // staged crosshair
+      if (stagedPx) {
+        const cx = stagedPx.px * sx, cy = stagedPx.py * sy;
+        ctx.strokeStyle = "#ffd93a";
+        ctx.lineWidth = 2 * devicePixelRatio;
+        ctx.setLineDash([6 * devicePixelRatio, 4 * devicePixelRatio]);
+        ctx.beginPath();
+        ctx.arc(cx, cy, 14 * devicePixelRatio, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(cx - 18 * devicePixelRatio, cy); ctx.lineTo(cx + 18 * devicePixelRatio, cy);
+        ctx.moveTo(cx, cy - 18 * devicePixelRatio); ctx.lineTo(cx, cy + 18 * devicePixelRatio);
+        ctx.stroke();
+      }
+    }
+
+    // hook calib draw into the raf loop
+    const origDrawOverlay = drawOverlay;
+    drawOverlay = function() { origDrawOverlay(); drawCalibLayer(); };
+
+    const cPoseEl = document.getElementById("c-pose");
+    function setStaged(px) {
+      stagedPx = px;
+      if (px) {
+        cStagedEl.textContent = `(${px.px}, ${px.py})`;
+        cCapBtn.disabled = false;
+        cAimBtn.disabled = calibPoints.length === 0;
+      } else {
+        cStagedEl.textContent = "—";
+        cCapBtn.disabled = true;
+        cAimBtn.disabled = true;
+      }
+    }
+
+    // mirror live turret pose into the calibration row so user knows what
+    // capture would save without scrolling up.
+    function updateCalibPose() {
+      if (!turretSnap) return;
+      const s = turretSnap.state || {};
+      cPoseEl.textContent = `pitch=${s.pitch ?? "?"} eff_yaw_ms=${s.eff_yaw_ms ?? "?"}`;
+    }
+    setInterval(updateCalibPose, 500);
+
+    calibLayer.addEventListener("click", (ev) => {
+      if (!calibModeOn) return;
+      const p = clickToImagePx(ev);
+      if (p) setStaged(p);
+    });
+
+    cModeBtn.addEventListener("click", () => {
+      calibModeOn = !calibModeOn;
+      cModeBtn.dataset.on = String(calibModeOn);
+      cModeBtn.classList.toggle("active", calibModeOn);
+      cModeBtn.querySelector("span").textContent = calibModeOn ? "ON" : "off";
+      calibLayer.classList.toggle("active", calibModeOn);
+      cHintEl.textContent = calibModeOn
+        ? "click the video to stage a pixel, aim the turret at it, then hit capture"
+        : "toggle on, then click a spot on the video to stage it";
+    });
+
+    cCapBtn.addEventListener("click", async () => {
+      if (!stagedPx) return;
+      try {
+        const r = await fetch("/calibration/capture", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(stagedPx),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          alert("capture failed: " + t);
+          return;
+        }
+        const j = await r.json();
+        calibPoints = j.points || [];
+        renderCalibList();
+        setStaged(null);
+      } catch (e) {
+        alert("capture error: " + e.message);
+      }
+    });
+
+    cAimBtn.addEventListener("click", () => {
+      if (!stagedPx) return;
+      sendTurret("aim_pixel", stagedPx);
+    });
+
+    cClearBtn.addEventListener("click", async () => {
+      if (!calibPoints.length) return;
+      if (!confirm(`Delete all ${calibPoints.length} calibration points?`)) return;
+      const r = await fetch("/calibration/clear", { method: "POST" });
+      const j = await r.json();
+      calibPoints = j.points || [];
+      renderCalibList();
+    });
+
+    function renderCalibList() {
+      cPointsEl.innerHTML = "";
+      if (!calibPoints.length) {
+        cPointsEl.innerHTML = `<div class="pt" style="color:#666">(no calibration points yet)</div>`;
+        cCapBtn.disabled = !stagedPx;
+        cAimBtn.disabled = true;
+        return;
+      }
+      for (const p of calibPoints) {
+        const row = document.createElement("div");
+        row.className = "pt";
+        row.innerHTML = `
+          <span class="idx">#${(p.index ?? 0) + 1}</span>
+          <span>px=(${p.px}, ${p.py})</span>
+          <span>pitch=${p.pitch}</span>
+          <span>yaw_ms=${p.yaw_ms}</span>
+          <button data-idx="${p.index}">×</button>
+        `;
+        row.querySelector("button").addEventListener("click", async (e) => {
+          const idx = e.target.dataset.idx;
+          const r = await fetch(`/calibration/points/${idx}`, { method: "DELETE" });
+          if (r.ok) {
+            const j = await r.json();
+            calibPoints = j.points || [];
+            renderCalibList();
+          }
+        });
+        cPointsEl.appendChild(row);
+      }
+      // aim test is OK once we have at least one point
+      cAimBtn.disabled = !stagedPx;
+    }
+
+    async function loadCalibration() {
+      try {
+        const r = await fetch("/calibration");
+        const j = await r.json();
+        calibPoints = j.points || [];
+        renderCalibList();
+      } catch (e) { console.warn("calibration load failed:", e); }
+    }
+    loadCalibration();
+
+    // --- event log polling ---
+    const evBody = document.getElementById("events-body");
+    let lastEventId = -1;
+    function fmtTs(ts) {
+      const d = new Date(ts * 1000);
+      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+    }
+    async function pollEvents() {
+      try {
+        const r = await fetch(`/events?since=${lastEventId}&limit=50`);
+        const j = await r.json();
+        const fresh = j.events || [];
+        if (!fresh.length) return;
+        if (lastEventId === -1) evBody.innerHTML = "";
+        for (const ev of fresh) {
+          const row = document.createElement("div");
+          row.className = "ev-row";
+          row.dataset.kind = ev.kind;
+          row.innerHTML = `
+            <span class="ev-ts">${fmtTs(ev.ts)}</span>
+            <span class="ev-kind">${ev.kind}</span>
+            <span class="ev-msg"></span>
+          `;
+          row.querySelector(".ev-msg").textContent = ev.message;
+          evBody.appendChild(row);
+          lastEventId = ev.id;
+        }
+        // trim to last 200 rows; keep the scroll glued to the bottom
+        while (evBody.childElementCount > 200) evBody.removeChild(evBody.firstChild);
+        evBody.scrollTop = evBody.scrollHeight;
+      } catch (_) {}
+    }
+    setInterval(pollEvents, 750);
+    pollEvents();
+
+    connect();
+  </script>
+</body>
+</html>

@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>taiga - camera</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #000;
+      color: #e6e6e6;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      overflow: hidden;
+      height: 100svh;
+      display: flex;
+      flex-direction: column;
+    }
+    #stage {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+      background: #111;
+    }
+    #video, #overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+    #video { object-fit: cover; }
+    #overlay { pointer-events: none; }
+    #hud {
+      padding: 0.5rem 0.75rem;
+      background: #0a0a0a;
+      border-top: 1px solid #222;
+      font-size: 0.8rem;
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    #hud .spacer { flex: 1; }
+    #hud button {
+      background: #1a1a1f;
+      color: #e6e6e6;
+      border: 1px solid #333;
+      padding: 0.4rem 0.8rem;
+      border-radius: 6px;
+      font: inherit;
+    }
+    #hud button[data-active="true"] { background: #2a6a2a; border-color: #3a8a3a; }
+    .dot {
+      display: inline-block;
+      width: 0.6rem;
+      height: 0.6rem;
+      border-radius: 50%;
+      margin-right: 0.3rem;
+      background: #555;
+    }
+    .dot.live { background: #3a8a3a; }
+    .dot.err  { background: #c04040; }
+    #stillness {
+      color: #b0b0b0;
+      font-variant-numeric: tabular-nums;
+    }
+    #stillness[data-stationary="true"] { color: #ff6a6a; font-weight: 700; }
+    #banner {
+      position: absolute;
+      top: 0.75rem;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(220, 60, 60, 0.9);
+      color: white;
+      padding: 0.5rem 1rem;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 0.9rem;
+      opacity: 0;
+      transition: opacity 0.2s;
+      pointer-events: none;
+    }
+    #banner[data-on="true"] { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+    <div id="banner">THREAT LOCKED</div>
+  </div>
+
+  <div id="hud">
+    <span><span id="ws-dot" class="dot"></span><span id="ws-status">disconnected</span></span>
+    <span id="fps">0 fps</span>
+    <span id="det">0 cats</span>
+    <span id="stillness">still: 0.0s</span>
+    <span class="spacer"></span>
+    <button id="start-btn">start</button>
+  </div>
+
+  <script>
+    // === config (live, polled from server) ===
+    // these mirror the stream_* knobs in /config. the phone polls /config every
+    // few seconds and applies whatever's there. if max_edge changes mid-session
+    // the capture canvas is rebuilt at the new size.
+    let TARGET_FPS = 10;
+    let JPEG_QUALITY = 0.6;
+    let MAX_EDGE = 640;
+    const CONFIG_POLL_MS = 3000;
+
+    // === refs ===
+    const videoEl = document.getElementById("video");
+    const overlayEl = document.getElementById("overlay");
+    const wsDot = document.getElementById("ws-dot");
+    const wsStatus = document.getElementById("ws-status");
+    const fpsEl = document.getElementById("fps");
+    const detEl = document.getElementById("det");
+    const stillnessEl = document.getElementById("stillness");
+    const bannerEl = document.getElementById("banner");
+    const startBtn = document.getElementById("start-btn");
+
+    // === state ===
+    let ws = null;
+    let wakeLock = null;
+    let captureTimer = null;
+    let captureCanvas = null;
+    let captureCtx = null;
+    let latestDetectionPayload = null;
+    let framesSent = 0;
+    let bytesSent = 0;
+    let running = false;
+    let uploadWidth = 0;
+    let uploadHeight = 0;
+    let videoWidth = 0;
+    let videoHeight = 0;
+
+    function setStatus(state, text) {
+      wsDot.className = "dot " + (state || "");
+      wsStatus.textContent = text;
+    }
+
+    async function requestWakeLock() {
+      try {
+        if ("wakeLock" in navigator) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          wakeLock.addEventListener("release", () => { wakeLock = null; });
+        }
+      } catch (e) { console.warn("wake lock failed:", e); }
+    }
+
+    document.addEventListener("visibilitychange", async () => {
+      if (!document.hidden && running && !wakeLock) await requestWakeLock();
+    });
+
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: "environment" },
+          width:  { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      });
+      videoEl.srcObject = stream;
+      await new Promise((res) => {
+        if (videoEl.readyState >= 2) return res();
+        videoEl.addEventListener("loadedmetadata", res, { once: true });
+      });
+      videoWidth = videoEl.videoWidth;
+      videoHeight = videoEl.videoHeight;
+      rebuildCaptureCanvas();
+    }
+
+    function rebuildCaptureCanvas() {
+      // size we send upstream is set by MAX_EDGE; downscale only.
+      const scale = Math.min(1, MAX_EDGE / Math.max(videoWidth, videoHeight));
+      uploadWidth = Math.round(videoWidth * scale);
+      uploadHeight = Math.round(videoHeight * scale);
+      captureCanvas = document.createElement("canvas");
+      captureCanvas.width = uploadWidth;
+      captureCanvas.height = uploadHeight;
+      captureCtx = captureCanvas.getContext("2d", { willReadFrequently: false });
+    }
+
+    function connectWs() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(`${proto}//${location.host}/ws/ingest`);
+      ws.binaryType = "arraybuffer";
+      setStatus("", "connecting...");
+      ws.addEventListener("open", () => setStatus("live", "connected"));
+      ws.addEventListener("close", () => {
+        setStatus("err", "disconnected - retrying");
+        if (running) setTimeout(connectWs, 1500);
+      });
+      ws.addEventListener("error", () => setStatus("err", "ws error"));
+      ws.addEventListener("message", (ev) => {
+        if (typeof ev.data === "string") {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "detections") {
+              latestDetectionPayload = msg;
+              updateHudFromDetections(msg);
+            }
+          } catch (_) {}
+        }
+      });
+    }
+
+    function updateHudFromDetections(msg) {
+      const n = (msg.detections || []).length;
+      detEl.textContent = `${n} cat${n === 1 ? "" : "s"}`;
+      const t = msg.track || {};
+      stillnessEl.textContent = `still: ${(t.stillness_s || 0).toFixed(1)}s`;
+      stillnessEl.dataset.stationary = t.stationary ? "true" : "false";
+      bannerEl.dataset.on = t.stationary ? "true" : "false";
+    }
+
+    async function captureOneFrame() {
+      if (!running) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      // simple backpressure: don't pile up bytes in the ws buffer
+      if (ws.bufferedAmount > 256 * 1024) return;
+
+      captureCtx.drawImage(videoEl, 0, 0, uploadWidth, uploadHeight);
+      const blob = await new Promise((r) => captureCanvas.toBlob(r, "image/jpeg", JPEG_QUALITY));
+      if (!blob) return;
+      const buf = await blob.arrayBuffer();
+      ws.send(buf);
+      framesSent++;
+      bytesSent += buf.byteLength;
+    }
+
+    // === overlay rendering ===
+    // we redraw the overlay on a raf loop rather than only when detections
+    // arrive. this way the overlay stays crisp during window resizes / scrolls
+    // even if no new detections have come in.
+    function drawOverlay() {
+      const rect = videoEl.getBoundingClientRect();
+      const cw = Math.round(rect.width * devicePixelRatio);
+      const ch = Math.round(rect.height * devicePixelRatio);
+      if (overlayEl.width !== cw || overlayEl.height !== ch) {
+        overlayEl.width = cw;
+        overlayEl.height = ch;
+      }
+      const ctx = overlayEl.getContext("2d");
+      ctx.clearRect(0, 0, cw, ch);
+
+      if (!latestDetectionPayload || !videoWidth || !videoHeight) return;
+      const msg = latestDetectionPayload;
+      const imgW = msg.image_size ? msg.image_size[0] : uploadWidth;
+      const imgH = msg.image_size ? msg.image_size[1] : uploadHeight;
+      if (!imgW || !imgH) return;
+
+      // the <video> is rendered with object-fit: cover, so we need to compute
+      // the same cropping the browser is applying, and map detection coords
+      // (which are in the uploaded-frame coordinate space, a scaled copy of
+      // the camera's native frame) onto the visible region.
+      const videoAspect = videoWidth / videoHeight;
+      const boxAspect = cw / ch;
+      let drawW, drawH, offsetX, offsetY;
+      if (videoAspect > boxAspect) {
+        // video is wider than box -> letterboxed horizontally, crop horizontally
+        drawH = ch;
+        drawW = drawH * videoAspect;
+        offsetX = (cw - drawW) / 2;
+        offsetY = 0;
+      } else {
+        drawW = cw;
+        drawH = drawW / videoAspect;
+        offsetX = 0;
+        offsetY = (ch - drawH) / 2;
+      }
+      const sx = drawW / imgW;
+      const sy = drawH / imgH;
+
+      ctx.lineWidth = 3 * devicePixelRatio;
+      ctx.font = `${14 * devicePixelRatio}px ui-monospace, monospace`;
+      ctx.textBaseline = "top";
+
+      const track = msg.track || {};
+      const stationary = !!track.stationary;
+      const bridged = !!track.bridged;
+      const trackedBbox = track.bbox || null;
+
+      const drawBox = (x, y, w, h, color, label, dashed) => {
+        ctx.strokeStyle = color;
+        ctx.setLineDash(dashed ? [8 * devicePixelRatio, 6 * devicePixelRatio] : []);
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+        const padX = 4 * devicePixelRatio, padY = 2 * devicePixelRatio;
+        const labelW = ctx.measureText(label).width + padX * 2;
+        const labelH = 14 * devicePixelRatio + padY * 2;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, Math.max(0, y - labelH), labelW, labelH);
+        ctx.fillStyle = "#000";
+        ctx.fillText(label, x + padX, Math.max(0, y - labelH) + padY);
+      };
+
+      // when bridged, there are no fresh detections but we still have a last-known bbox
+      if (bridged && trackedBbox) {
+        const x = offsetX + trackedBbox[0] * sx;
+        const y = offsetY + trackedBbox[1] * sy;
+        const w = (trackedBbox[2] - trackedBbox[0]) * sx;
+        const h = (trackedBbox[3] - trackedBbox[1]) * sy;
+        const color = stationary ? "#ff3a3a" : "#ffd93a";
+        drawBox(x, y, w, h, color, "tracking (no lock)", true);
+        return;
+      }
+
+      for (const d of msg.detections || []) {
+        const x = offsetX + d.x1 * sx;
+        const y = offsetY + d.y1 * sy;
+        const w = (d.x2 - d.x1) * sx;
+        const h = (d.y2 - d.y1) * sy;
+        const isTracked = trackedBbox
+          && Math.abs(d.x1 - trackedBbox[0]) < 0.5
+          && Math.abs(d.y1 - trackedBbox[1]) < 0.5;
+        const color = isTracked
+          ? (stationary ? "#ff3a3a" : "#ffd93a")
+          : "#3affa0";
+        const label = `${d.cls} ${(d.conf * 100).toFixed(0)}%`;
+        drawBox(x, y, w, h, color, label, false);
+      }
+    }
+
+    (function rafLoop() {
+      drawOverlay();
+      requestAnimationFrame(rafLoop);
+    })();
+
+    // hud stats tick
+    setInterval(() => {
+      fpsEl.textContent = `${framesSent} fps`;
+      framesSent = 0;
+      bytesSent = 0;
+    }, 1000);
+
+    // poll /config for stream_* knobs; apply changes on the next frame.
+    async function pollServerConfig() {
+      try {
+        const r = await fetch("/config", { cache: "no-store" });
+        if (!r.ok) return;
+        const cfg = await r.json();
+        const newFps = (cfg.stream_fps        || {}).value;
+        const newQ   = (cfg.stream_jpeg_quality|| {}).value;
+        const newE   = (cfg.stream_max_edge   || {}).value;
+
+        if (typeof newQ === "number") JPEG_QUALITY = newQ;
+
+        // changing fps means re-pacing the capture interval
+        if (typeof newFps === "number" && newFps !== TARGET_FPS) {
+          TARGET_FPS = newFps;
+          if (running && captureTimer) {
+            clearInterval(captureTimer);
+            captureTimer = setInterval(captureOneFrame, Math.round(1000 / TARGET_FPS));
+          }
+        }
+        // changing resolution means rebuilding the capture canvas
+        if (typeof newE === "number" && newE !== MAX_EDGE) {
+          MAX_EDGE = newE;
+          if (videoWidth && videoHeight) rebuildCaptureCanvas();
+        }
+      } catch (_) {}
+    }
+    setInterval(pollServerConfig, CONFIG_POLL_MS);
+    pollServerConfig();
+
+    async function start() {
+      if (running) return;
+      try { await startCamera(); }
+      catch (e) { alert("camera error: " + e.message); return; }
+      running = true;
+      startBtn.dataset.active = "true";
+      startBtn.textContent = "stop";
+      await requestWakeLock();
+      connectWs();
+      captureTimer = setInterval(captureOneFrame, Math.round(1000 / TARGET_FPS));
+    }
+
+    function stop() {
+      running = false;
+      startBtn.dataset.active = "false";
+      startBtn.textContent = "start";
+      clearInterval(captureTimer);
+      captureTimer = null;
+      if (ws) { ws.close(); ws = null; }
+      const stream = videoEl.srcObject;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      videoEl.srcObject = null;
+      if (wakeLock) { wakeLock.release(); wakeLock = null; }
+      setStatus("", "stopped");
+      latestDetectionPayload = null;
+      bannerEl.dataset.on = "false";
+    }
+
+    startBtn.addEventListener("click", () => (running ? stop() : start()));
+  </script>
+</body>
+</html>

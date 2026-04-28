@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# yolo weights (downloaded on first run, ~6mb each)
+*.pt
+
+# per-installation calibration: pixel->turret mapping is specific to the
+# physical setup of this machine's camera + turret
+calibration.json

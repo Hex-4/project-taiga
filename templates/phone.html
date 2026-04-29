@@ -28,9 +28,14 @@
       inset: 0;
       width: 100%;
       height: 100%;
+      transform-origin: center center;
+      transition: transform 0.15s ease;
     }
     #video { object-fit: cover; }
     #overlay { pointer-events: none; }
+    #stage[data-rot="90"]  #video, #stage[data-rot="90"]  #overlay { transform: rotate(90deg);  }
+    #stage[data-rot="180"] #video, #stage[data-rot="180"] #overlay { transform: rotate(180deg); }
+    #stage[data-rot="270"] #video, #stage[data-rot="270"] #overlay { transform: rotate(270deg); }
     #hud {
       padding: 0.5rem 0.75rem;
       background: #0a0a0a;
@@ -96,7 +101,9 @@
     <span id="fps">0 fps</span>
     <span id="det">0 cats</span>
     <span id="stillness">still: 0.0s</span>
+    <span id="rot-label" style="color:#888;font-size:0.75rem;">rot: 0°</span>
     <span class="spacer"></span>
+    <button id="rotate-btn" title="cycle rotation 90° (applies to upload + preview)">rotate ↻</button>
     <button id="start-btn">start</button>
   </div>
 
@@ -120,6 +127,9 @@
     const stillnessEl = document.getElementById("stillness");
     const bannerEl = document.getElementById("banner");
     const startBtn = document.getElementById("start-btn");
+    const rotateBtn = document.getElementById("rotate-btn");
+    const rotLabel = document.getElementById("rot-label");
+    const stageEl = document.getElementById("stage");
 
     // === state ===
     let ws = null;
@@ -135,6 +145,23 @@
     let uploadHeight = 0;
     let videoWidth = 0;
     let videoHeight = 0;
+    let ROTATION = (() => {
+      const v = Number(localStorage.getItem("camera_rotation"));
+      return [0, 90, 180, 270].includes(v) ? v : 0;
+    })();
+
+    function effectiveVideoSize() {
+      if (ROTATION === 90 || ROTATION === 270) {
+        return { w: videoHeight, h: videoWidth };
+      }
+      return { w: videoWidth, h: videoHeight };
+    }
+
+    function applyRotation() {
+      stageEl.dataset.rot = String(ROTATION);
+      rotLabel.textContent = `rot: ${ROTATION}°`;
+      if (videoWidth && videoHeight) rebuildCaptureCanvas();
+    }
 
     function setStatus(state, text) {
       wsDot.className = "dot " + (state || "");
@@ -175,9 +202,11 @@
 
     function rebuildCaptureCanvas() {
       // size we send upstream is set by MAX_EDGE; downscale only.
-      const scale = Math.min(1, MAX_EDGE / Math.max(videoWidth, videoHeight));
-      uploadWidth = Math.round(videoWidth * scale);
-      uploadHeight = Math.round(videoHeight * scale);
+      // when rotated 90/270 the effective frame has w/h swapped vs the source.
+      const eff = effectiveVideoSize();
+      const scale = Math.min(1, MAX_EDGE / Math.max(eff.w, eff.h));
+      uploadWidth = Math.round(eff.w * scale);
+      uploadHeight = Math.round(eff.h * scale);
       captureCanvas = document.createElement("canvas");
       captureCanvas.width = uploadWidth;
       captureCanvas.height = uploadHeight;
@@ -223,7 +252,19 @@
       // simple backpressure: don't pile up bytes in the ws buffer
       if (ws.bufferedAmount > 256 * 1024) return;
 
-      captureCtx.drawImage(videoEl, 0, 0, uploadWidth, uploadHeight);
+      if (ROTATION === 0) {
+        captureCtx.drawImage(videoEl, 0, 0, uploadWidth, uploadHeight);
+      } else {
+        // rotate around the canvas center; for 90/270 the source is drawn into
+        // the *swapped* dims so it fills the post-rotation upload exactly.
+        const drawW = (ROTATION === 90 || ROTATION === 270) ? uploadHeight : uploadWidth;
+        const drawH = (ROTATION === 90 || ROTATION === 270) ? uploadWidth  : uploadHeight;
+        captureCtx.save();
+        captureCtx.translate(uploadWidth / 2, uploadHeight / 2);
+        captureCtx.rotate((ROTATION * Math.PI) / 180);
+        captureCtx.drawImage(videoEl, -drawW / 2, -drawH / 2, drawW, drawH);
+        captureCtx.restore();
+      }
       const blob = await new Promise((r) => captureCanvas.toBlob(r, "image/jpeg", JPEG_QUALITY));
       if (!blob) return;
       const buf = await blob.arrayBuffer();
@@ -256,8 +297,11 @@
       // the <video> is rendered with object-fit: cover, so we need to compute
       // the same cropping the browser is applying, and map detection coords
       // (which are in the uploaded-frame coordinate space, a scaled copy of
-      // the camera's native frame) onto the visible region.
-      const videoAspect = videoWidth / videoHeight;
+      // the camera's native frame) onto the visible region. when rotated, the
+      // <video> + <canvas> are CSS-rotated together as a unit, so the math
+      // below is in the post-rotation reference frame.
+      const eff = effectiveVideoSize();
+      const videoAspect = eff.w / eff.h;
       const boxAspect = cw / ch;
       let drawW, drawH, offsetX, offsetY;
       if (videoAspect > boxAspect) {
@@ -396,6 +440,13 @@
     }
 
     startBtn.addEventListener("click", () => (running ? stop() : start()));
+
+    rotateBtn.addEventListener("click", () => {
+      ROTATION = (ROTATION + 90) % 360;
+      localStorage.setItem("camera_rotation", String(ROTATION));
+      applyRotation();
+    });
+    applyRotation();
   </script>
 </body>
 </html>

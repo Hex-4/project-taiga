@@ -366,6 +366,19 @@
     <div class="knobs" id="knobs">
       <!-- populated by js from /config -->
     </div>
+    <div id="model-picker" style="padding: 0.5rem 1rem 1rem; border-top: 1px solid #1c1c22; display: grid; gap: 0.5rem; font-size: 0.8rem;">
+      <div style="color: #9fc6ff; font-size: 0.75rem; letter-spacing: 0.05em; text-transform: uppercase;">model</div>
+      <div class="row" style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+        <label>active:
+          <select id="m-select" style="background:#161619;color:#e6e6e6;border:1px solid #2a2a32;padding:0.3rem 0.5rem;border-radius:4px;font:inherit;"></select>
+        </label>
+        <button id="m-quantize" style="background:#1a1a1f;color:#e6e6e6;border:1px solid #333;padding:0.35rem 0.75rem;border-radius:6px;font:inherit;cursor:pointer;font-size:0.8rem;">quantize to int8</button>
+        <span id="m-status" style="color: #888; font-size: 0.75rem;"></span>
+      </div>
+      <div style="color: #777; font-size: 0.7rem; line-height: 1.3;">
+        int8 quant: ~1.5-3x faster on cpu, ~1-3% mAP loss. needs the phone streaming so it can grab calibration frames (~5-10s of capture).
+      </div>
+    </div>
   </details>
 
   <details class="classes" id="classes">
@@ -840,6 +853,62 @@
       }
     }
     loadConfig();
+
+    // --- model picker + quantize ---
+    const mSelect = document.getElementById("m-select");
+    const mQuantBtn = document.getElementById("m-quantize");
+    const mStatus = document.getElementById("m-status");
+
+    async function loadModels() {
+      try {
+        const r = await fetch("/detector/models");
+        const j = await r.json();
+        mSelect.innerHTML = "";
+        for (const m of (j.models || [])) {
+          const opt = document.createElement("option");
+          opt.value = m.stem;
+          opt.textContent = `${m.stem} (${m.size_mb}MB)${m.is_int8 ? " — int8" : ""}`;
+          if (m.stem === j.current) opt.selected = true;
+          mSelect.appendChild(opt);
+        }
+      } catch (e) { console.warn("loadModels:", e); }
+    }
+    mSelect.addEventListener("change", async () => {
+      mStatus.textContent = "switching...";
+      try {
+        const r = await fetch("/detector/model", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ stem: mSelect.value }),
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.detail || "switch failed");
+        mStatus.textContent = `active: ${j.current}`;
+      } catch (e) {
+        mStatus.textContent = "error: " + e.message;
+      }
+    });
+    mQuantBtn.addEventListener("click", async () => {
+      if (!confirm("Quantize to int8?\n\nNeeds the phone streaming for ~10 seconds. Takes ~30-60s on the server. ~1-3% mAP drop typically.")) return;
+      mQuantBtn.disabled = true;
+      mStatus.textContent = "capturing calibration frames + quantizing...";
+      try {
+        const r = await fetch("/quantize", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ frames: 30, timeout_s: 15, auto_use: true }),
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.detail || "quantize failed");
+        mStatus.textContent = `int8 ready: ${j.out} (${j.out_size_mb}MB from ${j.src_size_mb}MB, ${j.frames_used} frames)`;
+        await loadModels();
+      } catch (e) {
+        mStatus.textContent = "error: " + e.message;
+      } finally {
+        mQuantBtn.disabled = false;
+      }
+    });
+    loadModels();
 
     // --- turret panel ---
     const tConnEl   = document.querySelector("#t-conn b");

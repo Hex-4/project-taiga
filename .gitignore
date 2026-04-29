@@ -9,8 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-# yolo weights (downloaded on first run, ~6mb each)
+# yolo weights / exports (downloaded or built on first run)
 *.pt
+*.onnx
 
 # per-installation calibration: pixel->turret mapping is specific to the
 # physical setup of this machine's camera + turret

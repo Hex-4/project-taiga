@@ -31,6 +31,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import cv2
+import numpy as np
+
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
@@ -446,6 +449,112 @@ async def set_config(payload: dict = Body(...)) -> dict:
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors, "config": _read_config()})
     return _read_config()
+
+
+# --- model picker + quantization ---
+
+@app.get("/detector/models")
+async def list_detector_models() -> dict:
+    """list every yolov8*.onnx in the project root."""
+    root = Path(".")
+    models = []
+    for p in sorted(root.glob("*.onnx")):
+        models.append({
+            "stem": p.stem,
+            "size_mb": round(p.stat().st_size / 1e6, 2),
+            "is_int8": "_int8" in p.stem.lower(),
+        })
+    return {"models": models, "current": detector.model_stem}
+
+
+@app.post("/detector/model")
+async def switch_detector_model(payload: dict = Body(...)) -> dict:
+    stem = str(payload.get("stem", "")).strip()
+    if not stem:
+        raise HTTPException(400, "payload must include 'stem'")
+    onnx_path = Path(f"{stem}.onnx")
+    pt_path = Path(f"{stem}.pt")
+    if not onnx_path.exists() and not pt_path.exists():
+        raise HTTPException(404, f"no model file found at {stem}.onnx or {stem}.pt")
+    await detector.set_model(stem)
+    log_event("detector", f"switched to model {stem!r}")
+    return {"current": detector.model_stem}
+
+
+@app.post("/quantize")
+async def quantize_model(payload: dict | None = Body(default=None)) -> dict:
+    """capture N frames from the live stream, run static int8 quantization,
+    write yolov8n_int8.onnx (or whatever <current>_int8.onnx).
+
+    payload (all optional):
+      frames     - desired number of calibration frames (default 30, min 5)
+      timeout_s  - max seconds to spend gathering frames (default 15)
+      auto_use   - if true, switch the active model to int8 on success (default true)
+    """
+    payload = payload or {}
+    target_count = max(5, min(200, int(payload.get("frames", 30))))
+    timeout_s = float(payload.get("timeout_s", 15.0))
+    auto_use = bool(payload.get("auto_use", True))
+
+    src_stem = detector.model_stem
+    if "_int8" in src_stem:
+        # don't double-quantize. fall back to the canonical fp32 model name.
+        src_stem = src_stem.replace("_int8", "")
+    src_onnx = Path(f"{src_stem}.onnx")
+    out_onnx = Path(f"{src_stem}_int8.onnx")
+    if not src_onnx.exists():
+        raise HTTPException(409, f"source model {src_onnx} doesn't exist")
+
+    # collect calibration frames from the LIVE ingest stream. each frame is
+    # only counted once thanks to the seq counter on the latest-only mailbox.
+    import time as _t
+    deadline = _t.monotonic() + timeout_s
+    last_seq = state.raw.seq
+    frames: list[np.ndarray] = []
+    log_event("detector", f"quantize: collecting up to {target_count} frames from live stream...")
+    while len(frames) < target_count and _t.monotonic() < deadline:
+        try:
+            seq, jpeg = await asyncio.wait_for(
+                state.raw.next_after(last_seq), timeout=max(0.1, deadline - _t.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            break
+        last_seq = seq
+        if not isinstance(jpeg, (bytes, bytearray)):
+            continue
+        arr = np.frombuffer(jpeg, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            frames.append(img)
+
+    if len(frames) < 5:
+        raise HTTPException(
+            400,
+            f"only got {len(frames)} calibration frames in {timeout_s}s; "
+            "need at least 5. open /phone and start streaming first.",
+        )
+
+    log_event("detector", f"quantize: running static int8 on {len(frames)} frames (~30s)...")
+    from quantize import quantize_with_frames
+    try:
+        result = await asyncio.to_thread(
+            quantize_with_frames, str(src_onnx), str(out_onnx), frames,
+        )
+    except Exception as e:
+        log_event("detector", f"quantize failed: {e!r}")
+        raise HTTPException(500, f"quantization failed: {e!r}")
+
+    log_event("detector", f"quantize: wrote {out_onnx.name} ({result['out_size_mb']}MB)")
+    if auto_use:
+        await detector.set_model(out_onnx.stem)
+        log_event("detector", f"switched to {out_onnx.stem}")
+
+    return {
+        **result,
+        "src": src_onnx.name,
+        "out": out_onnx.name,
+        "current": detector.model_stem,
+    }
 
 
 # --- target classes endpoints ---

@@ -134,7 +134,6 @@
     // === state ===
     let ws = null;
     let wakeLock = null;
-    let captureTimer = null;
     let captureCanvas = null;
     let captureCtx = null;
     let latestDetectionPayload = null;
@@ -145,6 +144,12 @@
     let uploadHeight = 0;
     let videoWidth = 0;
     let videoHeight = 0;
+    // single-frame-in-flight gate: cleared by an ack-or-detections message
+    // from the server. without this, frames pile up in the kernel TCP buffer
+    // on flaky wifi and end-to-end latency creeps to multiple seconds.
+    let inFlight = false;
+    let releaseFlight = null;
+    let captureLoopRunning = false;
     let ROTATION = (() => {
       const v = Number(localStorage.getItem("camera_rotation"));
       return [0, 90, 180, 270].includes(v) ? v : 0;
@@ -213,26 +218,43 @@
       captureCtx = captureCanvas.getContext("2d", { willReadFrequently: false });
     }
 
+    function clearInFlight() {
+      inFlight = false;
+      if (releaseFlight) {
+        const r = releaseFlight;
+        releaseFlight = null;
+        r();
+      }
+    }
+
     function connectWs() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       ws = new WebSocket(`${proto}//${location.host}/ws/ingest`);
       ws.binaryType = "arraybuffer";
       setStatus("", "connecting...");
-      ws.addEventListener("open", () => setStatus("live", "connected"));
+      ws.addEventListener("open", () => {
+        setStatus("live", "connected");
+        // any prior in-flight gate is moot on a fresh socket
+        clearInFlight();
+      });
       ws.addEventListener("close", () => {
         setStatus("err", "disconnected - retrying");
+        clearInFlight();
         if (running) setTimeout(connectWs, 1500);
       });
       ws.addEventListener("error", () => setStatus("err", "ws error"));
       ws.addEventListener("message", (ev) => {
-        if (typeof ev.data === "string") {
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg.type === "detections") {
-              latestDetectionPayload = msg;
-              updateHudFromDetections(msg);
-            }
-          } catch (_) {}
+        if (typeof ev.data !== "string") return;
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        if (msg.type === "ack" || msg.type === "detections") {
+          // any reply from the server clears the in-flight gate, so we can
+          // send the next frame as fast as the wire allows.
+          clearInFlight();
+        }
+        if (msg.type === "detections") {
+          latestDetectionPayload = msg;
+          updateHudFromDetections(msg);
         }
       });
     }
@@ -247,10 +269,9 @@
     }
 
     async function captureOneFrame() {
-      if (!running) return;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      // simple backpressure: don't pile up bytes in the ws buffer
-      if (ws.bufferedAmount > 256 * 1024) return;
+      if (!running || !captureCtx) return false;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      if (!videoEl.videoWidth) return false;  // camera not ready yet
 
       if (ROTATION === 0) {
         captureCtx.drawImage(videoEl, 0, 0, uploadWidth, uploadHeight);
@@ -266,11 +287,57 @@
         captureCtx.restore();
       }
       const blob = await new Promise((r) => captureCanvas.toBlob(r, "image/jpeg", JPEG_QUALITY));
-      if (!blob) return;
-      const buf = await blob.arrayBuffer();
-      ws.send(buf);
+      if (!blob) return false;
+      // send the Blob directly: the browser streams it to the socket without
+      // copying into a JS arraybuffer first. one less allocation per frame.
+      ws.send(blob);
       framesSent++;
-      bytesSent += buf.byteLength;
+      bytesSent += blob.size;
+      return true;
+    }
+
+    // self-rescheduling capture loop. instead of setInterval (which fires
+    // regardless of whether the previous frame got out the door), we wait
+    // for a server ack (or a 2s safety timeout) before sending the next
+    // frame. this caps end-to-end latency at one round-trip + processing,
+    // even on a flaky link, because the kernel TCP buffer never fills up.
+    async function captureLoop() {
+      if (captureLoopRunning) return;
+      captureLoopRunning = true;
+      try {
+        while (running) {
+          const cycleStart = performance.now();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            inFlight = true;
+            const ackPromise = new Promise((res) => { releaseFlight = res; });
+            try {
+              const sent = await captureOneFrame();
+              if (sent) {
+                // wait for ack/detections - or 2s, whichever comes first.
+                // 2s is generous; if we hit it, the link is wedged anyway and
+                // sending another frame won't make things worse.
+                await Promise.race([
+                  ackPromise,
+                  new Promise((res) => setTimeout(res, 2000)),
+                ]);
+              }
+            } catch (e) {
+              console.warn("capture failed:", e);
+            } finally {
+              clearInFlight();
+            }
+          }
+          // pace: don't fire faster than TARGET_FPS even if acks arrive
+          // instantly. server still drops frames it can't keep up with via
+          // its latest-only mailbox, but no point making it work harder than
+          // we asked for.
+          const elapsed = performance.now() - cycleStart;
+          const wait = (1000 / TARGET_FPS) - elapsed;
+          if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+        }
+      } finally {
+        captureLoopRunning = false;
+      }
     }
 
     // === overlay rendering ===
@@ -393,13 +460,10 @@
 
         if (typeof newQ === "number") JPEG_QUALITY = newQ;
 
-        // changing fps means re-pacing the capture interval
+        // capture loop reads TARGET_FPS each cycle, so just updating the
+        // value is enough - no timer to recreate.
         if (typeof newFps === "number" && newFps !== TARGET_FPS) {
           TARGET_FPS = newFps;
-          if (running && captureTimer) {
-            clearInterval(captureTimer);
-            captureTimer = setInterval(captureOneFrame, Math.round(1000 / TARGET_FPS));
-          }
         }
         // changing resolution means rebuilding the capture canvas
         if (typeof newE === "number" && newE !== MAX_EDGE) {
@@ -420,15 +484,14 @@
       startBtn.textContent = "stop";
       await requestWakeLock();
       connectWs();
-      captureTimer = setInterval(captureOneFrame, Math.round(1000 / TARGET_FPS));
+      captureLoop();  // self-rescheduling, returns when running flips false
     }
 
     function stop() {
       running = false;
       startBtn.dataset.active = "false";
       startBtn.textContent = "start";
-      clearInterval(captureTimer);
-      captureTimer = null;
+      clearInFlight();
       if (ws) { ws.close(); ws = null; }
       const stream = videoEl.srcObject;
       if (stream) stream.getTracks().forEach((t) => t.stop());

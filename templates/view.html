@@ -459,7 +459,7 @@
 
   <div id="stage">
     <div id="frameWrap">
-      <img id="frame" alt="waiting for frames..." />
+      <canvas id="frame" aria-label="live camera frame"></canvas>
       <canvas id="overlay"></canvas>
       <canvas id="calib-layer"></canvas>
       <div id="banner">THREAT LOCKED</div>
@@ -493,7 +493,14 @@
   </section>
 
   <script>
-    const img = document.getElementById("frame");
+    // #frame is a <canvas>: we decode the jpeg via createImageBitmap and draw
+    // it directly. (the previous version used an <img> with URL.createObjectURL,
+    // which had two issues: (1) the JPEG and the JSON overlay arrived in
+    // separate ws messages, opening a window where the overlay could draw
+    // against the previous frame, and (2) img.onload being async meant slow
+    // decodes could land out of order if the network burst-delivered backlog).
+    const frame = document.getElementById("frame");
+    const frameCtx = frame.getContext("2d");
     const overlay = document.getElementById("overlay");
     const wsDot = document.getElementById("ws-dot");
     const wsStatus = document.getElementById("ws-status");
@@ -504,29 +511,62 @@
     const infEl = document.getElementById("inf");
     const bannerEl = document.getElementById("banner");
 
-    let currentUrl = null;
     let framesReceived = 0;
     let latestPayload = null;
+    let displayedSeq = -1;  // most recent seq actually drawn to the canvas
 
     function setStatus(state, text) {
       wsDot.className = "dot " + (state || "");
       wsStatus.textContent = text;
     }
 
-    function renderFrame(blob) {
-      const url = URL.createObjectURL(blob);
-      const prev = currentUrl;
-      img.onload = () => {
-        resEl.textContent = `${img.naturalWidth}x${img.naturalHeight}`;
-        if (prev) URL.revokeObjectURL(prev);
-      };
-      img.src = url;
-      currentUrl = url;
+    // parse the combined binary frame: [u32 BE header_len][json][jpeg]
+    function unpackFrame(buf) {
+      const view = new DataView(buf);
+      const headerLen = view.getUint32(0);
+      const headerBytes = new Uint8Array(buf, 4, headerLen);
+      const jpegBytes = new Uint8Array(buf, 4 + headerLen);
+      const header = JSON.parse(new TextDecoder().decode(headerBytes));
+      return { header, jpegBytes };
+    }
+
+    async function renderFrame(buf) {
+      let unpacked;
+      try { unpacked = unpackFrame(buf); }
+      catch (e) { console.warn("unpack failed:", e); return; }
+      const { header, jpegBytes } = unpacked;
+
+      // out-of-order or stale? skip the decode entirely, save battery.
+      // (TCP guarantees in-order on a single socket, but receive coalescing
+      // + queued processing means an older frame in the queue can lose to
+      // a fresh one already drawn.)
+      if (header.seq <= displayedSeq) return;
+
+      // kick off decode in parallel; drop result if stale by the time it's done.
+      const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+      let bitmap;
+      try { bitmap = await createImageBitmap(blob); }
+      catch (e) { console.warn("decode failed:", e); return; }
+      if (header.seq <= displayedSeq) {
+        bitmap.close && bitmap.close();
+        return;
+      }
+
+      if (frame.width !== bitmap.width || frame.height !== bitmap.height) {
+        frame.width = bitmap.width;
+        frame.height = bitmap.height;
+      }
+      frameCtx.drawImage(bitmap, 0, 0);
+      bitmap.close && bitmap.close();
+      displayedSeq = header.seq;
+      latestPayload = header;
+      updateHudFromPayload(header);
+      resEl.textContent = `${frame.width}x${frame.height}`;
     }
 
     function drawOverlay() {
-      // size overlay to match the rendered img
-      const rect = img.getBoundingClientRect();
+      // size overlay to match the rendered frame canvas
+      const rect = frame.getBoundingClientRect();
       const w = Math.round(rect.width * devicePixelRatio);
       const h = Math.round(rect.height * devicePixelRatio);
       if (overlay.width !== w || overlay.height !== h) {
@@ -536,9 +576,9 @@
       const ctx = overlay.getContext("2d");
       ctx.clearRect(0, 0, w, h);
 
-      if (!latestPayload || !img.naturalWidth) return;
-      const imgW = latestPayload.image_size ? latestPayload.image_size[0] : img.naturalWidth;
-      const imgH = latestPayload.image_size ? latestPayload.image_size[1] : img.naturalHeight;
+      if (!latestPayload || !frame.width) return;
+      const imgW = latestPayload.image_size ? latestPayload.image_size[0] : frame.width;
+      const imgH = latestPayload.image_size ? latestPayload.image_size[1] : frame.height;
       if (!imgW || !imgH) return;
       const sx = w / imgW;
       const sy = h / imgH;
@@ -608,7 +648,9 @@
     function connect() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(`${proto}//${location.host}/ws/view`);
-      ws.binaryType = "blob";
+      // arraybuffer, not blob: we want to peek at the header before deciding
+      // whether to spend cycles on decode. blob would require an extra arrayBuffer() await.
+      ws.binaryType = "arraybuffer";
       setStatus("", "connecting...");
       ws.addEventListener("open", () => setStatus("live", "connected"));
       ws.addEventListener("close", () => {
@@ -620,10 +662,7 @@
         if (typeof ev.data === "string") {
           try {
             const msg = JSON.parse(ev.data);
-            if (msg.type === "detections") {
-              latestPayload = msg;
-              updateHudFromPayload(msg);
-            } else if (msg.type === "heartbeat") {
+            if (msg.type === "heartbeat") {
               setStatus(msg.ingest_connected ? "live" : "err",
                 msg.ingest_connected ? "connected - awaiting frames" : "no phone connected");
             }
@@ -1178,23 +1217,22 @@
     let stagedPx = null;   // {px, py} in original image coords
     let calibModeOn = false;
 
-    // convert a click on the <img> into its native image coordinates. the
-    // img is rendered with max-width/max-height so it may be letterboxed OR
-    // scaled down - we account for that by looking at getBoundingClientRect.
+    // convert a click on the frame canvas into its native image coordinates.
+    // the canvas is rendered with max-width/max-height (CSS), so the rect
+    // size differs from the canvas's intrinsic dims.
     function clickToImagePx(ev) {
-      if (!img.naturalWidth) return null;
-      const rect = img.getBoundingClientRect();
+      if (!frame.width) return null;
+      const rect = frame.getBoundingClientRect();
       const x = ev.clientX - rect.left;
       const y = ev.clientY - rect.top;
-      // css pixel -> image pixel (no letterboxing on <img> with object-fit: initial)
-      const ix = Math.round(x * (img.naturalWidth / rect.width));
-      const iy = Math.round(y * (img.naturalHeight / rect.height));
-      if (ix < 0 || iy < 0 || ix > img.naturalWidth || iy > img.naturalHeight) return null;
+      const ix = Math.round(x * (frame.width / rect.width));
+      const iy = Math.round(y * (frame.height / rect.height));
+      if (ix < 0 || iy < 0 || ix > frame.width || iy > frame.height) return null;
       return { px: ix, py: iy };
     }
 
     function drawCalibLayer() {
-      const rect = img.getBoundingClientRect();
+      const rect = frame.getBoundingClientRect();
       const w = Math.round(rect.width * devicePixelRatio);
       const h = Math.round(rect.height * devicePixelRatio);
       if (calibLayer.width !== w || calibLayer.height !== h) {
@@ -1203,9 +1241,9 @@
       }
       const ctx = calibCtx();
       ctx.clearRect(0, 0, w, h);
-      if (!img.naturalWidth) return;
-      const sx = w / img.naturalWidth;
-      const sy = h / img.naturalHeight;
+      if (!frame.width) return;
+      const sx = w / frame.width;
+      const sy = h / frame.height;
 
       // existing points as numbered dots
       ctx.font = `${11 * devicePixelRatio}px ui-monospace, monospace`;

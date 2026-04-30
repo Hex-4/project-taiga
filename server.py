@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,6 +147,9 @@ class AnnotatedFrame:
     ts: float
     # increments for every frame the worker produces, so clients can tell them apart
     seq: int
+    # cached binary payload (header_len|json|jpeg) so we don't re-serialize
+    # for every viewer.
+    _packed: Optional[bytes] = None
 
     def detections_payload(self) -> dict:
         return {
@@ -156,6 +160,18 @@ class AnnotatedFrame:
             "detections": [d.as_dict() for d in self.detections],
             "track": self.track.as_dict(),
         }
+
+    def packed(self) -> bytes:
+        """[u32 BE header_len][json header bytes][jpeg bytes].
+
+        sent to viewers as one ws binary frame so the image and its overlay
+        arrive atomically. the json header is the same shape as detections_payload
+        so existing client code can keep using it.
+        """
+        if self._packed is None:
+            header = json.dumps(self.detections_payload(), separators=(",", ":")).encode("utf-8")
+            self._packed = struct.pack(">I", len(header)) + header + self.jpeg
+        return self._packed
 
 
 class LatestSlot:
@@ -214,7 +230,12 @@ state = BusState(
 
 
 async def detection_worker() -> None:
-    """consume raw frames, run detection + tracker, publish annotated results."""
+    """consume raw frames, run detection + tracker, publish annotated results.
+
+    detections back to the phone are NOT pushed from here - the ingest handler
+    subscribes to state.annotated itself and forwards them, so all sends on
+    the phone websocket happen from a single coroutine (no interleaving).
+    """
     last_seq = 0
     while True:
         seq, jpeg = await state.raw.next_after(last_seq)
@@ -241,15 +262,6 @@ async def detection_worker() -> None:
         state.annotated.publish(annotated)
         state.frames_processed += 1
         state.last_inference_ms = inference_ms
-
-        # echo detections back to the source phone (best-effort; fire-and-forget)
-        phone_ws = state.ingest_ws
-        if phone_ws is not None:
-            try:
-                await phone_ws.send_text(json.dumps(annotated.detections_payload()))
-            except Exception:
-                # if the phone's gone, the ingest handler will notice and clean up
-                pass
 
         if track.stationary:
             log_event("threat",
@@ -783,7 +795,18 @@ async def stats() -> dict:
 
 @app.websocket("/ws/ingest")
 async def ws_ingest(ws: WebSocket) -> None:
-    """the phone connects here and pushes jpeg frames. we echo detections back."""
+    """the phone connects here and pushes jpeg frames.
+
+    flow control: every jpeg gets an immediate {"type":"ack","seq":N} reply so
+    the phone can hold itself to one frame in flight. that pins the queue depth
+    at 1 across both the JS-side ws buffer and the kernel TCP buffer, killing
+    the multi-second latency pile-ups we used to see on flaky wifi.
+
+    detections that come back asynchronously from the worker are forwarded onto
+    the same socket - same seq numbering. ack messages and detection messages
+    both go through a single asyncio.Queue so they can never interleave on the
+    wire.
+    """
     await ws.accept()
     if state.ingest_ws is not None:
         # one source at a time - politely kick out the previous one
@@ -791,6 +814,36 @@ async def ws_ingest(ws: WebSocket) -> None:
             await state.ingest_ws.close(code=1000, reason="superseded")
     state.ingest_ws = ws
     print(f"[ingest] phone connected from {ws.client}")
+
+    # bounded queue: if the phone link is wedged, drop oldest text msgs rather
+    # than memory-leak. detection payloads are stale fast anyway.
+    out_q: asyncio.Queue[str] = asyncio.Queue(maxsize=16)
+
+    def queue_text(payload: str) -> None:
+        try:
+            out_q.put_nowait(payload)
+        except asyncio.QueueFull:
+            # drop the oldest pending message and try again
+            with contextlib.suppress(asyncio.QueueEmpty):
+                out_q.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                out_q.put_nowait(payload)
+
+    async def writer() -> None:
+        while True:
+            payload = await out_q.get()
+            await ws.send_text(payload)
+
+    async def detection_forwarder() -> None:
+        last_ann = state.annotated.seq  # skip whatever was already there
+        while True:
+            seq, af = await state.annotated.next_after(last_ann)
+            last_ann = seq
+            queue_text(json.dumps(af.detections_payload()))
+
+    writer_task = asyncio.create_task(writer())
+    forwarder_task = asyncio.create_task(detection_forwarder())
+
     try:
         while True:
             message = await ws.receive()
@@ -799,11 +852,18 @@ async def ws_ingest(ws: WebSocket) -> None:
             if (data := message.get("bytes")) is not None:
                 state.frames_received += 1
                 state.raw.publish(data)
+                # ack immediately - this is the signal the phone uses to release
+                # its single-frame-in-flight gate. fire-and-forget into the queue.
+                queue_text(json.dumps({"type": "ack", "seq": state.frames_received}))
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"[ingest] error: {e!r}")
     finally:
+        for t in (writer_task, forwarder_task):
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
         if state.ingest_ws is ws:
             state.ingest_ws = None
         print("[ingest] phone disconnected")
@@ -811,9 +871,17 @@ async def ws_ingest(ws: WebSocket) -> None:
 
 @app.websocket("/ws/view")
 async def ws_view(ws: WebSocket) -> None:
-    """viewers get (a) binary jpeg frame, then (b) a json detection payload,
-    paired together with the same seq number. clients draw the image then the
-    overlay once both arrive."""
+    """viewers get one binary frame per detection pass: a small json header
+    followed by the jpeg, packed as [u32 BE header_len][header][jpeg]. one
+    frame = one ws message means the image and its overlay can never get out
+    of phase, and there's no chance for a viewer to draw an old jpeg under a
+    fresh overlay (or vice versa).
+
+    flow control: ws.send_bytes awaits until the transport accepts the frame.
+    after each send we go straight back to next_after(last_seq), which always
+    yields the LATEST seq - so if the worker produced 3 frames while we were
+    sending one, we automatically skip to the newest and drop the others. no
+    queue buildup either side."""
     await ws.accept()
     print(f"[view] viewer connected from {ws.client}")
     last_seq = state.annotated.seq  # skip whatever was already there
@@ -830,8 +898,7 @@ async def ws_view(ws: WebSocket) -> None:
                 continue
             last_seq = seq
             assert isinstance(af, AnnotatedFrame)
-            await ws.send_bytes(af.jpeg)
-            await ws.send_text(json.dumps(af.detections_payload()))
+            await ws.send_bytes(af.packed())
     except WebSocketDisconnect:
         pass
     except Exception as e:

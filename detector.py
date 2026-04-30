@@ -81,18 +81,29 @@ def _ensure_onnx_export(pt_path: Path, onnx_path: Path) -> None:
     this is the only place we still touch ultralytics; it's a build-time
     operation, not a runtime one. once `yolov8n.onnx` exists, subsequent
     runs skip the import entirely.
+
+    if the .pt is also missing, YOLO(stem) auto-downloads it from the
+    ultralytics releases cdn - so a fresh checkout of the project boots
+    with zero manual steps. the export takes ~30s on first run, then we're
+    permanently in onnx-only land.
     """
     if onnx_path.exists():
         return
-    if not pt_path.exists():
-        raise FileNotFoundError(
-            f"{pt_path} not found and {onnx_path} doesn't exist either - "
-            "fetch the .pt first (any predict/export call with ultralytics will "
-            "auto-download it) or copy a .onnx into place."
-        )
-    print(f"[detector] exporting {pt_path.name} -> {onnx_path.name} (one-time)")
+    print(
+        f"[detector] no {onnx_path.name} found - exporting from {pt_path.name}. "
+        "if the .pt is missing too, ultralytics will fetch it from its release "
+        "cdn first. this takes ~30s and only happens once."
+    )
     from ultralytics import YOLO  # heavy import, only when needed
-    YOLO(str(pt_path)).export(format="onnx", opset=12, simplify=True, dynamic=False)
+    # YOLO("yolov8n.pt") will download the weights to cwd if neither the file
+    # nor an ultralytics cache hit exists, so a fresh checkout boots with
+    # zero manual steps. the export then writes the .onnx next to the .pt.
+    YOLO(pt_path.name).export(format="onnx", opset=12, simplify=True, dynamic=False)
+    if not onnx_path.exists():
+        raise FileNotFoundError(
+            f"export completed but {onnx_path} not found - check cwd / the "
+            "ultralytics cache dir, or copy the .onnx into the project root."
+        )
 
 
 def _letterbox(img: np.ndarray, target: int = INPUT_SIZE) -> tuple[np.ndarray, float, int, int]:

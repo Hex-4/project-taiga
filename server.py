@@ -553,8 +553,16 @@ async def quantize_model(payload: dict | None = Body(default=None)) -> dict:
             quantize_with_frames, str(src_onnx), str(out_onnx), frames,
         )
     except Exception as e:
+        # full traceback to stdout - the repr-only error in /events is rarely
+        # enough to diagnose a deep onnxruntime / shape-inference failure.
+        import traceback
+        tb = traceback.format_exc()
         log_event("detector", f"quantize failed: {e!r}")
-        raise HTTPException(500, f"quantization failed: {e!r}")
+        print(tb)
+        # surface the first line of the traceback to the UI too, since most
+        # quantize errors have a useful one-liner ("Could not find an ..." etc).
+        head = str(e).strip().splitlines()[0] if str(e).strip() else repr(e)
+        raise HTTPException(500, f"quantization failed: {head}")
 
     log_event("detector", f"quantize: wrote {out_onnx.name} ({result['out_size_mb']}MB)")
     if auto_use:

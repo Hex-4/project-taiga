@@ -49,12 +49,25 @@ class FrameCalibrationReader(CalibrationDataReader):
         return next(self._iter, None)
 
 
+def _read_input_name(onnx_path: str) -> str:
+    """introspect the onnx model to find its first input name.
+
+    we used to hardcode "images" (ultralytics' default) - but a user-supplied
+    onnx (e.g. one downloaded from a model zoo) might call it "input",
+    "input_0", "data", etc. wrong name silently produces empty calibration
+    and quantize_static fails downstream with a cryptic error.
+    """
+    import onnxruntime as ort
+    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    return sess.get_inputs()[0].name
+
+
 def quantize_with_frames(
     src_onnx: str | Path,
     out_onnx: str | Path,
     frames: list[np.ndarray],
     *,
-    input_name: str = "images",
+    input_name: str | None = None,
 ) -> dict:
     """run static int8 quantization. blocking - call in a thread.
 
@@ -66,6 +79,9 @@ def quantize_with_frames(
         raise FileNotFoundError(f"{src} doesn't exist")
     if not frames:
         raise ValueError("need at least 1 calibration frame; ideally 20+")
+
+    if input_name is None:
+        input_name = _read_input_name(str(src))
 
     # ort's quantizer wants the model pre-processed to fold constants and
     # infer shapes. this writes a temp file that we throw away after quantizing.

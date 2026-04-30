@@ -937,12 +937,21 @@
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ frames: 30, timeout_s: 15, auto_use: true }),
         });
-        const j = await r.json();
-        if (!r.ok) throw new Error(j.detail || "quantize failed");
+        // read as text first so we can show the raw body on non-json responses
+        // (a 500 from a deep onnxruntime crash, a connection drop, etc.)
+        const text = await r.text();
+        let j = null;
+        try { j = JSON.parse(text); } catch (_) { /* non-json - fall through */ }
+        if (!r.ok) {
+          const detail = (j && (j.detail || j.error)) || text.slice(0, 300) || `HTTP ${r.status}`;
+          throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        }
+        if (!j) throw new Error("server returned non-json: " + text.slice(0, 300));
         mStatus.textContent = `int8 ready: ${j.out} (${j.out_size_mb}MB from ${j.src_size_mb}MB, ${j.frames_used} frames)`;
         await loadModels();
       } catch (e) {
         mStatus.textContent = "error: " + e.message;
+        console.error("quantize failed:", e);
       } finally {
         mQuantBtn.disabled = false;
       }
